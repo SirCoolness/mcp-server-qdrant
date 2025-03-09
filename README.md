@@ -2,7 +2,7 @@
 
 [![smithery badge](https://smithery.ai/badge/mcp-server-qdrant)](https://smithery.ai/protocol/mcp-server-qdrant)
 
-> The [Model Context Protocol (MCP)](https://modelcontextprotocol.io/introduction) is an open protocol that enables seamless integration between LLM applications and external data sources and tools. Whether you’re building an AI-powered IDE, enhancing a chat interface, or creating custom AI workflows, MCP provides a standardized way to connect LLMs with the context they need.
+> The [Model Context Protocol (MCP)](https://modelcontextprotocol.io/introduction) is an open protocol that enables seamless integration between LLM applications and external data sources and tools. Whether you're building an AI-powered IDE, enhancing a chat interface, or creating custom AI workflows, MCP provides a standardized way to connect LLMs with the context they need.
 
 This repository is an example of how to create a MCP server for [Qdrant](https://qdrant.tech/), a vector search engine.
 
@@ -189,8 +189,35 @@ The configuration of the server can be also done using environment variables:
 - `COLLECTION_PREFIX`: Prefix for all collections in multi-collection mode
 - `PROTECT_COLLECTIONS`: Comma-separated list of collection names that are protected from deletion operations (insert-only). In multi-collection mode, if specified without values, all collections will be insert-only.
 - `READONLY_COLLECTIONS`: Comma-separated list of collection names that are completely read-only (no insertions or deletions). In multi-collection mode, if specified without values, all collections will be read-only.
+- `AS_SERVER`: Run as an HTTP server with SSE transport at the specified address (format: host:port)
+- `DEBUG`: Enable debug logging (set to any value to enable)
 
 You cannot provide `QDRANT_URL` and `QDRANT_LOCAL_PATH` at the same time.
+
+## Transport Options
+
+By default, the server uses STDIO transport, which is suitable for direct integration with applications like Claude Desktop. However, you can also run it as an HTTP server with Server-Sent Events (SSE) transport.
+
+### Running as an HTTP Server with SSE Transport
+
+To run the server as an HTTP server with SSE transport, use the `--as-server` option:
+
+```bash
+uvx mcp-server-qdrant \
+  --qdrant-url "http://localhost:6333" \
+  --collection-name "my_collection" \
+  --as-server "localhost:26653" \
+  --debug
+```
+
+This will start an HTTP server at the specified address with the following endpoints:
+
+- `/`: Root endpoint that redirects to the health check endpoint
+- `/sse`: The SSE endpoint for establishing a connection
+- `/messages`: The endpoint for sending messages to the server
+- `/health`: A health check endpoint that returns server status information
+
+When running as an HTTP server, clients can connect to the SSE endpoint to receive server messages and send messages to the server via POST requests to the messages endpoint.
 
 ## Contributing
 

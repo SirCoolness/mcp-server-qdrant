@@ -1,13 +1,32 @@
 import asyncio
 import importlib.metadata
 import json
-from typing import Optional, Dict, Any, List
+import logging
+import re
+import signal
+from contextlib import asynccontextmanager
+from typing import Optional, Dict, Any, List, Tuple
+from urllib.parse import urlparse
+from uuid import UUID
 
 import click
 import mcp
+import mcp.server
 import mcp.types as types
 from mcp.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
+from pydantic import ValidationError
+
+# Import SSE-related modules
+import uvicorn
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.routing import Route
+from starlette.responses import JSONResponse, RedirectResponse
+from starlette.types import Scope, Receive, Send
+
+# Import the SSE server transport
+from mcp.server.sse import SseServerTransport
 
 from .embeddings.factory import create_embedding_provider
 from .qdrant import QdrantConnector
@@ -21,6 +40,21 @@ def get_package_version() -> str:
         # Fall back to a default version if package is not installed
         return "0.0.0"
 
+
+# Set up logging
+logger = logging.getLogger("mcp_server_qdrant")
+
+def configure_logging(log_level=logging.INFO):
+    """Configure logging for the application."""
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    # Set log levels for specific loggers
+    logging.getLogger("mcp_server_qdrant").setLevel(log_level)
+    logging.getLogger("mcp.server.sse").setLevel(log_level)
+    logging.getLogger("uvicorn").setLevel(log_level)
 
 def serve(
     qdrant_connector: QdrantConnector,
@@ -452,6 +486,18 @@ def serve(
     is_flag=False,
     flag_value="",
 )
+@click.option(
+    "--as-server",
+    envvar="AS_SERVER",
+    required=False,
+    help="Run as an HTTP server with SSE transport at the specified address (format: host:port)",
+)
+@click.option(
+    "--debug",
+    envvar="DEBUG",
+    is_flag=True,
+    help="Enable debug logging",
+)
 def main(
     qdrant_url: Optional[str],
     qdrant_api_key: str,
@@ -464,7 +510,12 @@ def main(
     collection_prefix: Optional[str],
     protect_collections: Optional[str],
     readonly_collections: Optional[str],
+    as_server: Optional[str],
+    debug: bool,
 ):
+    # Configure logging
+    configure_logging(logging.DEBUG if debug else logging.INFO)
+    
     # XOR of url and local path, since we accept only one of them
     if not (bool(qdrant_url) ^ bool(qdrant_local_path)):
         raise ValueError(
@@ -516,39 +567,190 @@ def main(
             readonly_collections_set = {"*"}
             
     async def _run():
-        async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-            # Create the embedding provider
-            provider = create_embedding_provider(
-                provider_type=embedding_provider,
-                model_name=embedding_model or fastembed_model_name,
-            )
+        # Create the embedding provider
+        provider = create_embedding_provider(
+            provider_type=embedding_provider,
+            model_name=embedding_model or fastembed_model_name,
+        )
 
-            # Create the Qdrant connector
-            qdrant_connector = QdrantConnector(
-                qdrant_url=qdrant_url,
-                qdrant_api_key=qdrant_api_key,
-                collection_name=collection_name,
-                embedding_provider=provider,
-                qdrant_local_path=qdrant_local_path,
-                multi_collection_mode=multi_collection_mode,
-                collection_prefix=collection_prefix,
-                protected_collections=protected_collections,
-                readonly_collections=readonly_collections_set,
-            )
+        # Create the Qdrant connector
+        qdrant_connector = QdrantConnector(
+            qdrant_url=qdrant_url,
+            qdrant_api_key=qdrant_api_key,
+            collection_name=collection_name,
+            embedding_provider=provider,
+            qdrant_local_path=qdrant_local_path,
+            multi_collection_mode=multi_collection_mode,
+            collection_prefix=collection_prefix,
+            protected_collections=protected_collections,
+            readonly_collections=readonly_collections_set,
+        )
 
-            # Create and run the server
-            server = serve(qdrant_connector)
-            await server.run(
-                read_stream,
-                write_stream,
-                InitializationOptions(
-                    server_name="qdrant",
-                    server_version=get_package_version(),
-                    capabilities=server.get_capabilities(
-                        notification_options=NotificationOptions(),
-                        experimental_capabilities={},
+        # Create the server
+        server = serve(qdrant_connector)
+        
+        # Check if we should run as an HTTP server with SSE transport
+        if as_server:
+            # Parse the host:port format
+            match = re.match(r"^([^:]+):(\d+)$", as_server)
+            if not match:
+                raise ValueError(f"Invalid server address format: {as_server}. Expected format: host:port")
+            
+            host, port_str = match.groups()
+            port = int(port_str)
+            
+            # Create an SSE transport
+            sse = SseServerTransport("/messages")
+            
+            # Create a wrapper for the SSE transport that adapts it to work with Starlette
+            class StarletteSSEAdapter:
+                def __init__(self, sse_transport):
+                    self.sse_transport = sse_transport
+                
+                @asynccontextmanager
+                async def connect_sse(self, request):
+                    async with self.sse_transport.connect_sse(
+                        request.scope, request.receive, request._send
+                    ) as streams:
+                        yield streams
+                
+                async def handle_post_message(self, request):
+                    # Extract the necessary information from the request
+                    session_id = request.query_params.get("session_id")
+                    logger.info(f"Received message for session: {session_id}")
+                    
+                    if session_id is None:
+                        logger.warning("Received request without session_id")
+                        return JSONResponse({"error": "session_id is required"}, status_code=400)
+                    
+                    try:
+                        session_id_uuid = UUID(hex=session_id)
+                        logger.debug(f"Parsed session ID: {session_id_uuid}")
+                    except ValueError:
+                        logger.warning(f"Received invalid session ID: {session_id}")
+                        return JSONResponse({"error": "Invalid session ID"}, status_code=400)
+                    
+                    writer = self.sse_transport._read_stream_writers.get(session_id_uuid)
+                    if not writer:
+                        logger.warning(f"Could not find session for ID: {session_id_uuid}")
+                        return JSONResponse({"error": "Could not find session"}, status_code=404)
+                    
+                    try:
+                        json_data = await request.json()
+                        logger.debug(f"Received JSON: {json_data}")
+                        
+                        message = types.JSONRPCMessage.model_validate(json_data)
+                        logger.info(f"Validated client message: {message}")
+                        
+                        await writer.send(message)
+                        logger.info(f"Message sent to writer for session: {session_id}")
+                        
+                        return JSONResponse({"status": "Accepted"}, status_code=202)
+                    except ValidationError as err:
+                        logger.error(f"Failed to parse message: {err}")
+                        await writer.send(err)
+                        return JSONResponse({"error": "Could not parse message"}, status_code=400)
+                    except Exception as e:
+                        logger.exception(f"Unexpected error handling message: {e}")
+                        return JSONResponse({"error": f"Unexpected error: {str(e)}"}, status_code=500)
+            
+            # Create the adapter
+            sse_adapter = StarletteSSEAdapter(sse)
+            
+            # Define handler functions
+            async def handle_sse(request):
+                async with sse_adapter.connect_sse(request) as streams:
+                    await server.run(
+                        streams[0], 
+                        streams[1], 
+                        InitializationOptions(
+                            server_name="qdrant",
+                            server_version=get_package_version(),
+                            capabilities=server.get_capabilities(
+                                notification_options=NotificationOptions(),
+                                experimental_capabilities={},
+                            ),
+                        )
+                    )
+                # This will only be reached when the SSE connection is closed
+                return JSONResponse({"status": "disconnected"})
+
+            async def handle_messages(request):
+                return await sse_adapter.handle_post_message(request)
+            
+            async def health_check(request):
+                return JSONResponse({
+                    "status": "ok",
+                    "version": get_package_version(),
+                    "server_type": "qdrant",
+                    "transport": "sse"
+                })
+            
+            async def root(request):
+                return RedirectResponse(url="/health")
+            
+            # Create Starlette routes
+            routes = [
+                Route("/", endpoint=root),
+                Route("/sse", endpoint=handle_sse),
+                Route("/messages", endpoint=handle_messages, methods=["POST"]),
+                Route("/health", endpoint=health_check)
+            ]
+            
+            # Create and run Starlette app with proper lifespan handling
+            @asynccontextmanager
+            async def lifespan(app):
+                # Startup code here (if any)
+                print("Starting up SSE server...")
+                yield
+                # Shutdown code here (if any)
+                print("Shutting down SSE server...")
+            
+            starlette_app = Starlette(routes=routes, lifespan=lifespan)
+            print(f"Starting SSE server at http://{host}:{port}")
+            print(f"Root endpoint: http://{host}:{port}/ (redirects to health)")
+            print(f"SSE endpoint: http://{host}:{port}/sse")
+            print(f"Messages endpoint: http://{host}:{port}/messages")
+            print(f"Health check endpoint: http://{host}:{port}/health")
+            
+            # Set up signal handlers for graceful shutdown
+            should_exit = False
+            
+            def handle_exit(signum, frame):
+                nonlocal should_exit
+                should_exit = True
+                print("\nShutting down gracefully... (Press Ctrl+C again to force)")
+            
+            # Use the default signal handlers from Uvicorn
+            # signal.signal(signal.SIGINT, handle_exit)
+            
+            # Use the non-blocking version of uvicorn.run
+            config = uvicorn.Config(
+                starlette_app, 
+                host=host, 
+                port=port, 
+                log_level="info",
+                limit_concurrency=100,
+                timeout_keep_alive=5,
+                timeout_graceful_shutdown=10
+            )
+            server_instance = uvicorn.Server(config)
+            # server_instance.should_exit = lambda: should_exit
+            await server_instance.serve()
+        else:
+            # Run with STDIO transport
+            async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+                await server.run(
+                    read_stream,
+                    write_stream,
+                    InitializationOptions(
+                        server_name="qdrant",
+                        server_version=get_package_version(),
+                        capabilities=server.get_capabilities(
+                            notification_options=NotificationOptions(),
+                            experimental_capabilities={},
+                        ),
                     ),
-                ),
-            )
+                )
 
     asyncio.run(_run())
